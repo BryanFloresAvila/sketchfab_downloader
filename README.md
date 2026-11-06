@@ -92,3 +92,33 @@ Full reverse engineering writeup in [`docs/sketchfab-binz-format.md`](docs/sketc
 ## License
 
 MIT
+
+## Viewer compatibility fixes
+
+This fork fixes `WASM abort` with viewer builds that re-export the static key
+from a CommonJS asset module. A fresh WASM decoder uses request ID `0` for key
+initialization, rather than the random transport seed.
+
+Material channels are parsed as complete JSON objects. Disabled normal maps no
+longer borrow an enabled flag or texture from neighboring channels. Color-only
+materials, base colors, metalness, glossiness-derived roughness, and double-sided
+settings are retained. Viewer JavaScript bundles are cached by their full URL.
+
+For networks that require the proxy support provided by curl:
+
+```bash
+SKETCHFAB_HTTP=curl node download.js <model-url-or-uid> output.glb
+```
+
+For models whose source coordinates are Z-up, explicitly request conversion to
+glTF Y-up. The default preserves existing orientation behavior:
+
+```bash
+SKETCHFAB_HTTP=curl SKETCHFAB_UP_AXIS=Z node download.js <model-url-or-uid> output.glb
+```
+
+Run regression tests with `node --test`. The fixes were exercised on the Courage
+model (`2a0f4b27d69a419a8944fdc8e4067d3f`): 13 meshes, 9 materials, one embedded
+color image, and no normal map, skin, or animation. Import/render was checked in
+Blender. This is not a guarantee of compatibility with every model or future
+viewer build. Model assets and viewer bundles are not included in the source.

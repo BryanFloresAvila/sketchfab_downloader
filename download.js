@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const zlib = require('zlib');
+const { readMaterials, materialProperties, extractExportedKey } = require('./viewer-config');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -18,7 +19,28 @@ let WORK_DIR = path.join(__dirname, '.cache');
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
-function fetch(url) {
+async function fetch(url) {
+    const parsed = new URL(url);
+    if (parsed.hostname === 'static.sketchfab.com' && parsed.pathname.endsWith('.js')) {
+        const cacheDir = path.join(__dirname, '.cache', 'viewer-js');
+        const file = path.join(cacheDir, require('crypto').createHash('sha256').update(url).digest('hex') + '.js');
+        if (fs.existsSync(file)) return fs.readFileSync(file);
+        const bytes = await fetchUncached(url);
+        fs.mkdirSync(cacheDir, { recursive: true });
+        fs.writeFileSync(file, bytes);
+        return bytes;
+    }
+    return fetchUncached(url);
+}
+
+function fetchUncached(url) {
+    if (process.env.SKETCHFAB_HTTP === 'curl') {
+        return new Promise((resolve, reject) => {
+            require('child_process').execFile('curl', ['-L', '-sS', '--fail', '--max-time', '60', url],
+                { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024 },
+                (error, stdout) => error ? reject(error) : resolve(stdout));
+        });
+    }
     return new Promise((resolve, reject) => {
         const get = url.startsWith('https') ? https.get : require('http').get;
         get(url, res => {
@@ -66,47 +88,21 @@ async function getModelConfig(uid) {
         return best;
     };
 
-    // Parse each material separately. A model can have several materials (e.g. an
-    // asteroid pack with one atlas per rock); applying one material's textures to
-    // every geometry makes the others' UVs land in the atlas's empty regions.
-    // Each material is "name": "...", "version": N, "channels": {...}. Pair every
-    // channels block with the material name just before it (works whether names
-    // are like "Asteroid_1_MAT" or "KOBRA_PAINT"), then read its enabled channels
-    // (bounding each channel to the next so a disabled one can't grab the next's
-    // texture). Also index materials by their albedo texture-set uid, which is how
-    // each geometry's StateSet references its material.
-    const CHANNELS = ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR'];
+    // Parse complete JSON objects: regex channel boundaries can accidentally
+    // borrow another channel's enable flag or texture.
+    const sourceMaterials = readMaterials(html);
     const materials = {};
     const materialsByAlbedo = {};
-    const chanStarts = [...html.matchAll(/"channels"\s*:\s*\{/g)].map(m => m.index);
-    const allNames = [...html.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map(m => ({ name: m[1], idx: m.index }));
-    for (let bi = 0; bi < chanStarts.length; bi++) {
-        const cs = chanStarts[bi];
-        let mat = null;
-        for (const mnp of allNames) if (mnp.idx < cs && (!mat || mnp.idx > mat.idx)) mat = mnp;
-        if (!mat) continue;
-        const block = html.slice(cs, bi + 1 < chanStarts.length ? chanStarts[bi + 1] : Math.min(html.length, cs + 6000));
+    for (const mat of Object.values(sourceMaterials)) {
         const chans = {};
-        for (const chName of CHANNELS) {
-            const ci = block.indexOf(`"${chName}"`);
-            if (ci < 0) continue;
-            let end = block.length;
-            for (const o of CHANNELS) {
-                if (o === chName) continue;
-                const oi = block.indexOf(`"${o}"`, ci + chName.length + 2);
-                if (oi > ci && oi < end) end = oi;
-            }
-            const sub = block.slice(ci, end);
-            if (!/"enable"\s*:\s*true/.test(sub)) continue;
-            const t = sub.match(/"texture"[\s\S]*?"uid"\s*:\s*"([a-f0-9]+)"/);
-            if (t) { chans[chName] = { ...(bestTexture(t[1]) || {}), setUid: t[1] }; if (chName === 'AlbedoPBR') chans[chName].albedoUid = t[1]; }
+        for (const chName of ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR']) {
+            const channel = mat.channels[chName];
+            if (!channel || !channel.enable || !channel.texture) continue;
+            const tex = bestTexture(channel.texture.uid);
+            if (tex) chans[chName] = { ...tex, setUid: channel.texture.uid };
         }
-        // keep only channels that resolved to a real texture file
-        for (const k of Object.keys(chans)) if (!chans[k].url) delete chans[k];
-        if (Object.keys(chans).length) {
-            materials[mat.name] = chans;
-            if (chans.AlbedoPBR && chans.AlbedoPBR.setUid) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
-        }
+        materials[mat.name] = chans; // Preserve color-only materials too.
+        if (chans.AlbedoPBR) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
     }
 
     // Backward-compatible single texture map (first material with an albedo).
@@ -116,7 +112,7 @@ async function getModelConfig(uid) {
         uid, baseUrl, html,
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
-        textureMap, materials, materialsByAlbedo
+        textureMap, materials, materialsByAlbedo, sourceMaterials
     };
 }
 
@@ -209,6 +205,8 @@ async function extractStaticKey(embedHtml) {
 
     for (const url of bundleUrls) {
         const js = (await fetch(url)).toString('utf8');
+        const exportedKey = extractExportedKey(js);
+        if (exportedKey) return exportedKey;
         const match = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
         if (match) return match[1];
         const match2 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
@@ -287,7 +285,8 @@ async function decryptBinz(binzPath, diterB, staticKey) {
     let xorAll = collected[19];
     for (let t = 0; t < 10; t++) xorAll ^= collected[2 * t];
     const keyArr = Array.from({ length: 10 }, (_, t) => collected[2 * t] ^ xorAll);
-    const keyOff = rickRolled(seed, 40);
+    // Each WASM instance starts with request ID zero; this is not the random seed.
+    const keyOff = rickRolled(0, 40);
     let mem = wasm.H();
     for (let t = 0; t < 10; t++) {
         let h = keyArr[t].toString(16); h = "0".repeat(4 - h.length) + h;
@@ -640,7 +639,7 @@ function resolveRefs(obj, uidMap) {
     return obj;
 }
 
-function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
+function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = {}) {
     console.log(`[5/6] Converting to glTF...`);
     const uidMap = {}; buildUidMap(osgjs, uidMap); resolveRefs(osgjs, uidMap);
 
@@ -846,7 +845,8 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         return idx;
     }
     function buildMaterial(name, chans) {
-        const mat = { name, pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 1, roughnessFactor: 1 } };
+        const source = Object.values(sourceMaterials).find(m => m.name === name);
+        const mat = materialProperties(name, source);
         if (chans) {
             const albedo = chans.AlbedoPBR;
             if (albedo) { const i = addTextureCached(albedo.cleanFile || albedo.filename); if (i >= 0) mat.pbrMetallicRoughness.baseColorTexture = { index: i }; }
@@ -894,6 +894,11 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         gltf.scenes[0].nodes.push(gltf.nodes.push(node) - 1);
     }
 
+    if (process.env.SKETCHFAB_UP_AXIS === 'Z') {
+        const children = gltf.scenes[0].nodes;
+        const root = gltf.nodes.push({ name: 'Z-up to Y-up', rotation: [-Math.SQRT1_2, 0, 0, Math.SQRT1_2], children }) - 1;
+        gltf.scenes[0].nodes = [root];
+    }
     const binBuffer = Buffer.concat(binChunks);
     gltf.buffers.push({ byteLength: binBuffer.length });
 
@@ -949,10 +954,10 @@ async function main() {
     const wirePath = path.join(WORK_DIR, 'model_file_wireframe.bin');
     if (fs.existsSync(wirePath)) wireBin = fs.readFileSync(wirePath);
 
-    const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles);
+    const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, config.sourceMaterials);
 
     fs.writeFileSync(outputPath, glb);
     console.log(`\n[6/6] Done! ${outputPath} (${(glb.length / 1024 / 1024).toFixed(1)} MB)`);
 }
 
-main().catch(e => { console.error('Error:', e.message); process.exit(1); });
+main().catch(e => { console.error('Error:', e.stack); process.exit(1); });
