@@ -86,7 +86,7 @@ Full reverse engineering writeup in [`docs/sketchfab-binz-format.md`](docs/sketc
 ## Notes
 
 - `decrypt.wasm` is automatically extracted from Sketchfab's viewer JS bundles on first run. No manual setup needed.
-- Texture descrambling requires `sharp`. Without it, the script falls back to using scrambled textures and prints a warning.
+- Texture preparation requires `sharp`. Download or decode failures stop the run instead of silently exporting scrambled textures.
 - Cached downloads are stored in `.cache/` and reused on subsequent runs for the same model.
 
 ## License
@@ -138,14 +138,15 @@ npm test
 ```
 
 Supported: skeletons, four bone influences per vertex, inverse bind matrices,
-translation/scale tracks, quaternion tracks, packed and delta/quantized vector
+translation/scale tracks, quaternion tracks (including spherical packed codes
+and multiplicative quaternion deltas), packed and delta/quantized vector
 tracks, morph targets and linear morph-weight animation. Separate facial tracks
 are merged on a shared timeline without losing their individual key times.
 DiffusePBR color textures are also retained when AlbedoPBR is disabled.
 
 The converter now fails on empty models, missing animation resources, unresolved
 targets and unsupported animation encodings instead of reporting a misleading
-success. Cubic Bézier tracks, compressed spherical/delta quaternions, animated
+success. Cubic Bézier tracks, non-spherical delta quaternions, animated
 transforms between a skeleton and its skinned geometry, and more than four
 influences require further work. The legacy standalone `osgjs2gltf.js` script is
 unchanged; use `download.js` for animated models.
@@ -153,3 +154,34 @@ unchanged; use `download.js` for animated models.
 See [animation research and validation](docs/animation-support.md) for the format
 mapping, evidence, limitations and integration results. Models, textures, viewer
 bundles and generated GLBs are not committed to this repository.
+
+## Additional material and export options
+
+Selected capabilities from [sfrip](https://github.com/Corpocore/sfrip) are now
+integrated while retaining this fork's animation fixes. See
+[attribution](THIRD_PARTY_NOTICES.md) and the
+[integration details and limits](docs/sfrip-integration.md).
+
+```bash
+# GLB plus editable external glTF, capped textures and concurrent downloads
+node download.js <model-url-or-uid> animal.glb --external --max-edge 2048 --concurrency 3
+
+# Combine eligible static parts, preserving animated meshes and rigs
+node download.js <model-url-or-uid> scene.glb --merge groups
+
+# Material factors without texture downloads; only print output path
+node download.js <model-url-or-uid> preview.glb --no-textures --quiet
+
+node download.js --help
+```
+
+Every successful CLI export writes an adjacent `.info.json` containing source
+attribution, counts, clip durations, warnings and the GLB checksum. The default
+merge mode is `off`; `objects` groups nearby static parts and `groups` groups
+parts below scene branches. Material boundaries remain separate primitives.
+
+Materials now retain AO, compatible opacity maps, constant transparency,
+clearcoat, sheen, transmission glass, emissive intensity, sparse UV bindings
+and wrap modes. Metalness/roughness maps can have different dimensions and
+gloss maps are inverted after applying their factor. Texture selection and
+HTTP retries reduce incomplete or incorrectly decoded downloads.
