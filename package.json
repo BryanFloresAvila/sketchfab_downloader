@@ -7,7 +7,8 @@
     "sketchfab-dl": "download.js"
   },
   "scripts": {
-    "download": "node download.js"
+    "download": "node download.js",
+    "test": "node --test"
   },
   "keywords": [
     "sketchfab",
