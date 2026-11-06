@@ -1,4 +1,5 @@
 "use strict";
+const { compatibleRotations } = require('./rotation-compat');
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 const meta = (o) =>
@@ -99,6 +100,7 @@ function collectAnimatedScene(
     skeleton = null,
     relative = IDENTITY,
     path = [],
+    inheritedStateSet = null,
   ) {
     const entry = Object.entries(wrapped).find(
       ([k]) => k.startsWith("osg.") || k.startsWith("osgAnimation."),
@@ -113,7 +115,7 @@ function collectAnimatedScene(
       const source = obj.SourceGeometry
         ? Object.values(obj.SourceGeometry)[0]
         : obj;
-      const g = processGeom(source);
+      const g = processGeom(source, {stateSet: obj.StateSet || inheritedStateSet});
       if (!g || !g.attributes.POSITION) return; // e.g. wireframe
       g.node = add({ name: source.Name || "mesh" }, parent);
       const count = g.attributes.POSITION.count;
@@ -143,7 +145,7 @@ function collectAnimatedScene(
               throw new Error("Joint index out of range");
             if (!Number.isFinite(weight[k]) || weight[k] < 0)
               throw new Error("Invalid skin weight");
-            joints[k] = joint[k];
+            joints[k] = weight[k] === 0 ? 0 : joint[k];
             sum += weight[k];
           }
           if (sum <= 0) throw new Error("Vertex has no skin influences");
@@ -285,7 +287,7 @@ function collectAnimatedScene(
       });
     }
     for (const child of obj.Children || [])
-      walk(child, node, skeleton, relative, path);
+      walk(child, node, skeleton, relative, path, obj.StateSet || inheritedStateSet);
   }
   walk(scene);
   if (!geometries.length)
@@ -310,10 +312,6 @@ function decodeChannel(type, channel, read) {
   const size = type.includes("Vec3") ? 3 : type.includes("Quat") ? 4 : 1,
     compressed = type.includes("Compressed"),
     packed = type.includes("Packed");
-  if (size === 4 && mode & 8)
-    throw new Error(
-      "Spherical compressed quaternion channels are not supported",
-    );
   function decode(def, width, isTime) {
     let data;
     if (Array.isArray(def) && typeof def[0] === "object") {
@@ -323,12 +321,47 @@ function decodeChannel(type, channel, read) {
         for (let j = 0; j < columns.length; j++)
           data[i * columns.length + j] = columns[j][i];
     } else data = Float32Array.from(read(def));
-    if (packed && !isTime && width > 1) {
+    // Spherical quaternions store a three-component axis/angle code, even
+    // though their decoded animation values have four components.
+    const spherical = !isTime && width === 4 && (mode & 8);
+    const storedWidth = spherical ? 3 : width;
+    if (packed && !isTime && storedWidth > 1) {
       const planar = data;
       data = new Float32Array(planar.length);
-      const n = data.length / width;
+      const n = data.length / storedWidth;
       for (let i = 0; i < n; i++)
-        for (let j = 0; j < width; j++) data[i * width + j] = planar[i + n * j];
+        for (let j = 0; j < storedWidth; j++) data[i * storedWidth + j] = planar[i + n * j];
+    }
+    if (spherical) {
+      if (data.length % 3) throw new Error("Invalid spherical quaternion keys");
+      const count = data.length / 3, delta = Boolean(mode & 4);
+      const out = new Float32Array((count + Number(delta)) * 4);
+      const pi = 3.14159265359, nphi = m.nphi || 720;
+      const cosEpsilon = Math.cos(0.01745329251 * (m.epsilon || 0.25));
+      if (delta) out.set([m.ox, m.oy, m.oz, m.ow]);
+      for (let i = 0; i < count; i++) {
+        const polar = data[i * 3] * pi / (nphi - 1);
+        const z = Math.cos(polar), radius = Math.sin(polar);
+        const offsetPolar = polar + 1.57079632679 / (nphi - 1);
+        const cosine = Math.max(-1, Math.min(1,
+          (cosEpsilon - z * Math.cos(offsetPolar)) /
+          Math.max(1e-5, radius * Math.sin(offsetPolar))));
+        const azimuth = 6.28318530718 * data[i * 3 + 1] /
+          Math.ceil(pi / Math.max(1e-5, Math.acos(cosine)));
+        const halfAngle = 0.000047938362584151635 * data[i * 3 + 2];
+        const sinHalf = Math.sin(halfAngle);
+        const q = [sinHalf * radius * Math.cos(azimuth),
+          sinHalf * radius * Math.sin(azimuth), sinHalf * z, Math.cos(halfAngle)];
+        const at = (i + Number(delta)) * 4;
+        // Accumulate in the viewer's order: previous orientation * delta.
+        if (delta) {
+          const [x, y, z, w] = out.subarray(at - 4, at);
+          const [a, b, c, d] = q;
+          out.set([x*d + y*c - z*b + w*a, -x*c + y*d + z*a + w*b,
+            x*b - y*a + z*d + w*c, -x*a - y*b - z*c + w*d], at);
+        } else out.set(q, at);
+      }
+      return out;
     }
     if (compressed && width === 3 && mode & 1)
       for (let i = 0; i < data.length; i++)
@@ -407,14 +440,30 @@ function writeAnimationData(scene, gltf, addAccessor) {
       }) - 1;
   }
   for (const clip of scene.clips) {
+    const decoded = (clip.Channels || []).map((wrapped) => {
+      const [type, channel] = Object.entries(wrapped)[0];
+      return { channel, track: decodeChannel(type, channel, scene.read) };
+    });
+    // OSG plays elapsed time + firstKeyTime and loops over end - firstKeyTime.
+    // Shift the whole clip together, retaining relative channel offsets.
+    const sourceStart = decoded.length
+      ? Math.min(...decoded.map(({ track }) => track.times[0])) : 0;
+    for (const { track } of decoded)
+      track.times = Float32Array.from(track.times, (time) => time - sourceStart);
     const animation = {
         name: clip.Name || "animation",
+        extras: { sourceStartTime: sourceStart },
         samplers: [],
         channels: [],
       },
       weightTracks = new Map(),
       used = new Set();
     function emit(node, path, times, values, size) {
+      if (path === 'rotation') {
+        const baked = compatibleRotations(times, values);
+        times = baked.times;
+        values = baked.values;
+      }
       const key = `${node}/${path}`;
       if (used.has(key)) throw new Error(`Duplicate animation target ${key}`);
       used.add(key);
@@ -426,9 +475,7 @@ function writeAnimationData(scene, gltf, addAccessor) {
         }) - 1;
       animation.channels.push({ sampler, target: { node, path } });
     }
-    for (const wrapped of clip.Channels || []) {
-      const [type, c] = Object.entries(wrapped)[0],
-        track = decodeChannel(type, c, scene.read);
+    for (const { channel: c, track } of decoded) {
       const target = scene.targets.get(`${c.TargetName}\0${c.Name}`);
       if (target) {
         if (track.size !== (target.path === "rotation" ? 4 : 3))
@@ -485,4 +532,5 @@ module.exports = {
   decodeChannel,
   referencedBuffers,
   multiply,
+  matrixOf,
 };

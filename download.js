@@ -8,10 +8,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+const {fetchBuffer, mapPool} = require('./http');
+const {parseArgs, HELP} = require('./cli-options');
+const {pickBestImage} = require('./vendor/sfrip/texture-selection');
+const {CHANNELS, createMaterialResolver, buildMaterial} = require('./materials');
+const {prepareTextures} = require('./textures');
+const {mergeStaticGeometries, pruneEmptyNodes} = require('./merge');
+const {writeOutputs} = require('./output');
 const zlib = require('zlib');
 const { collectAnimatedScene, writeAnimationData, referencedBuffers } = require('./animation');
-const { readMaterials, materialProperties, extractExportedKey } = require('./viewer-config');
+const { readMaterials, extractExportedKey, readEmbeddedResource } = require('./viewer-config');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -34,34 +40,15 @@ async function fetch(url) {
     return fetchUncached(url);
 }
 
-function fetchUncached(url) {
-    if (process.env.SKETCHFAB_HTTP === 'curl') {
-        return new Promise((resolve, reject) => {
-            require('child_process').execFile('curl', ['-L', '-sS', '--fail', '--max-time', '60', url],
-                { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024 },
-                (error, stdout) => error ? reject(error) : resolve(stdout));
-        });
-    }
-    return new Promise((resolve, reject) => {
-        const get = url.startsWith('https') ? https.get : require('http').get;
-        get(url, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return fetch(res.headers.location).then(resolve, reject);
-            }
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-        }).on('error', reject);
-    });
-}
+function fetchUncached(url) { return fetchBuffer(url); }
 
 function fetchText(url) { return fetch(url).then(b => b.toString('utf8')); }
 
 // ─── Step 1: Parse embed page ─────────────────────────────────────────────────
 
-async function getModelConfig(uid) {
+async function getModelConfig(uid, options = {}) {
     console.log(`[1/6] Fetching embed page...`);
-    const html = (await fetchText(`https://sketchfab.com/models/${uid}/embed`)).replace(/&#34;/g, '"');
+    const html = (await fetchText(`https://sketchfab.com/models/${uid}/embed`)).replace(/&#34;|&quot;/g, '"').replace(/&amp;/g, '&');
 
     const pMatch = html.match(/"p"\s*:\s*\[\{[^}]*"v"\s*:\s*(\d+)[^}]*"b"\s*:\s*"([^"]+)"/);
     const binzMatch = html.match(/https:\/\/media\.sketchfab\.com\/models\/[^"]*\/files\/[^"]*\/file\.binz/);
@@ -69,42 +56,32 @@ async function getModelConfig(uid) {
 
     const baseUrl = binzMatch[0].replace(/\/file\.binz$/, '');
 
-    // Extract the texture registry: texture-set uid → best (largest) image.
-    const texEntries = {};
-    const texPattern = /"uid":\s*"([^"]+)"[\s\S]*?"width":\s*(\d+)[\s\S]*?"url":\s*"([^"]+)"[\s\S]*?"pk":\s*(\d+)/g;
-    let tm;
-    while ((tm = texPattern.exec(html)) !== null) {
-        const [, , w, url, pk] = tm;
-        const setMatch = url.match(/\/textures\/([^/]+)\//);
-        if (!setMatch) continue;
-        const setUid = setMatch[1];
-        const key = `${setUid}_${w}`;
-        if (!texEntries[key] || parseInt(w) > texEntries[key].width) {
-            texEntries[key] = { setUid, url, pk: parseInt(pk), width: parseInt(w), filename: url.split('/').pop() };
-        }
-    }
+    const model = readEmbeddedResource(html, `/i/models/${uid}`) || {};
+    const sourceMaterials = model.options?.materials
+        ? Object.fromEntries(Object.entries(model.options.materials).filter(([,v]) => v?.channels)) : readMaterials(html);
+    const registry = readEmbeddedResource(html, `/i/models/${uid}/textures?optimized=1`)
+        || readEmbeddedResource(html, `/i/models/${uid}/textures`);
     const bestTexture = (setUid) => {
-        let best = null;
-        for (const e of Object.values(texEntries)) if (e.setUid === setUid && (!best || e.width > best.width)) best = e;
-        return best;
+        const texture = registry?.results?.find(t => t.uid === setUid);
+        if (!texture) throw new Error(`Texture ${setUid} missing from viewer registry`);
+        const image = pickBestImage(texture.images, options.maxEdge, texture.pk);
+        if (!image) throw new Error(`Texture ${setUid} has no usable image`);
+        const pkValue = Object.hasOwn(image, 'pk') ? image.pk : texture.pk;
+        const filename = `${setUid}_${path.basename(new URL(image.url).pathname)}`;
+        return {setUid, url:image.url, pk:pkValue == null ? null : Number(pkValue),
+            width:image.width, height:image.height, filename, sourceName:texture.name || filename};
     };
-
-    // Parse complete JSON objects: regex channel boundaries can accidentally
-    // borrow another channel's enable flag or texture.
-    const sourceMaterials = readMaterials(html);
-    const materials = {};
-    const materialsByAlbedo = {};
-    for (const mat of Object.values(sourceMaterials)) {
+    const materials = {}, materialsByAlbedo = {};
+    for (const [id, mat] of Object.entries(sourceMaterials)) {
         const chans = {};
-        for (const chName of ['AlbedoPBR', 'DiffusePBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR']) {
-            const channel = mat.channels[chName];
-            if (!channel || !channel.enable || !channel.texture) continue;
-            const tex = bestTexture(channel.texture.uid);
-            if (tex) chans[chName] = { ...tex, setUid: channel.texture.uid };
+        if (options.textures !== false) for (const name of CHANNELS) {
+            const channel = mat.channels[name];
+            if (!channel?.enable || !channel.texture?.uid) continue;
+            if (name.startsWith('ClearCoat') && !mat.channels.ClearCoat?.enable) continue;
+            if (name === 'Sheen' && !mat.channels.Sheen?.enable) continue;
+            chans[name] = bestTexture(channel.texture.uid);
         }
-        if (!chans.AlbedoPBR && chans.DiffusePBR) chans.AlbedoPBR = chans.DiffusePBR;
-        delete chans.DiffusePBR;
-        materials[mat.name] = chans; // Preserve color-only materials too.
+        materials[id] = chans;
         if (chans.AlbedoPBR) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
     }
 
@@ -112,7 +89,7 @@ async function getModelConfig(uid) {
     const textureMap = Object.values(materials).find(m => m.AlbedoPBR) || Object.values(materials)[0] || {};
 
     return {
-        uid, baseUrl, html,
+        uid, baseUrl, html, model,
         animationUrls: Object.fromEntries([...html.matchAll(/https:\/\/media\.sketchfab\.com\/models\/[^"\s]+\/animations\/([a-f0-9]+\.bin\.gz)/g)].map(m => [m[1], m[0]])),
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
@@ -122,7 +99,7 @@ async function getModelConfig(uid) {
 
 // ─── Step 2: Download files ───────────────────────────────────────────────────
 
-async function downloadFiles(config) {
+async function downloadFiles(config, options = {}) {
     console.log(`[2/6] Downloading model files...`);
     fs.mkdirSync(path.join(WORK_DIR, 'textures'), { recursive: true });
 
@@ -141,20 +118,15 @@ async function downloadFiles(config) {
         }
     }
 
-    // Download textures for every material (dedup by filename).
-    const seen = new Set();
-    for (const chans of Object.values(config.materials || { m: config.textureMap })) {
-        for (const [ch, tex] of Object.entries(chans)) {
-            if (seen.has(tex.filename)) continue;
-            seen.add(tex.filename);
-            const dest = path.join(WORK_DIR, 'textures', tex.filename);
-            if (!fs.existsSync(dest)) {
-                const data = await fetch(tex.url);
-                fs.writeFileSync(dest, data);
-                console.log(`  ${ch} texture: ${data.length} bytes`);
-            }
+    const textures = [...new Map(Object.values(config.materials).flatMap(ch => Object.values(ch)).map(t => [t.filename,t])).values()];
+    await mapPool(textures, options.concurrency || 3, async tex => {
+        const dest = path.join(WORK_DIR, 'textures', tex.filename);
+        if (!fs.existsSync(dest)) {
+            const data = await fetch(tex.url);
+            fs.writeFileSync(dest, data);
+            console.log(`  Texture ${tex.filename}: ${data.length} bytes`);
         }
-    }
+    });
 }
 
 // ─── Step 2.5: Extract decrypt.wasm from viewer JS ───────────────────────────
@@ -438,72 +410,9 @@ function descrambleTexture(imgBuf, w, h, channels, pk) {
     return result;
 }
 
-async function descrambleTextures(config) {
-    console.log(`[4/6] Descrambling textures...`);
-    // Use sharp or jimp for image decode. Fall back to raw decode.
-    let decodeImage, encodeImage;
-    try {
-        const sharp = require('sharp');
-        decodeImage = async (p) => {
-            const { data, info } = await sharp(p).raw().toBuffer({ resolveWithObject: true });
-            return { data, width: info.width, height: info.height, channels: info.channels };
-        };
-        encodeImage = async (buf, w, h, ch, outPath) => {
-            await sharp(buf, { raw: { width: w, height: h, channels: ch } })
-                .toFormat(outPath.endsWith('.png') ? 'png' : 'jpeg', { quality: 95 })
-                .toFile(outPath);
-        };
-    } catch (e) {
-        // Fallback: use the scrambled textures as-is (user can descramble separately)
-        console.log('  sharp not available — install with: npm install sharp');
-        console.log('  Using scrambled textures (run descramble.py separately)');
-        return config.materials && Object.keys(config.materials).length ? config.materials : { default: config.textureMap };
-    }
-
-    // Descramble every texture (dedup by filename), then build one clean map per
-    // material plus that material's combined metal/rough texture.
-    const descrambledCache = {};
-    async function descrambleOne(tex) {
-        if (descrambledCache[tex.filename]) return descrambledCache[tex.filename];
-        const ext = tex.filename.endsWith('.png') ? '.png' : '.jpeg';
-        const cleanName = tex.filename.replace(/\.[^.]+$/, '') + '_clean' + ext;
-        const dstPath = path.join(WORK_DIR, 'textures', cleanName);
-        if (!fs.existsSync(dstPath)) {
-            const img = await decodeImage(path.join(WORK_DIR, 'textures', tex.filename));
-            console.log(`  ${tex.filename}: ${img.width}x${img.height} pk=${tex.pk}`);
-            const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
-            await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
-        }
-        descrambledCache[tex.filename] = cleanName;
-        return cleanName;
-    }
-
-    const mats = (config.materials && Object.keys(config.materials).length) ? config.materials : { default: config.textureMap };
-    const materialsClean = {};
-    for (const [matName, chans] of Object.entries(mats)) {
-        const cleanMap = {};
-        for (const [chName, tex] of Object.entries(chans)) {
-            cleanMap[chName] = { ...tex, cleanFile: await descrambleOne(tex) };
-        }
-        // glTF packs roughness in the G channel and metalness in the B channel of
-        // one texture; Sketchfab ships them separately, so combine per material.
-        if (cleanMap.MetalnessPBR && cleanMap.RoughnessPBR) {
-            const combName = cleanMap.MetalnessPBR.cleanFile.replace(/_clean.*/, '') + '_metalrough.png';
-            const combPath = path.join(WORK_DIR, 'textures', combName);
-            if (!fs.existsSync(combPath)) {
-                const mImg = await decodeImage(path.join(WORK_DIR, 'textures', cleanMap.MetalnessPBR.cleanFile));
-                const rImg = await decodeImage(path.join(WORK_DIR, 'textures', cleanMap.RoughnessPBR.cleanFile));
-                const w = mImg.width, h = mImg.height, mc = mImg.channels, rc = rImg.channels;
-                const out = Buffer.alloc(w * h * 3);
-                for (let i = 0; i < w * h; i++) { out[i * 3] = 255; out[i * 3 + 1] = rImg.data[i * rc]; out[i * 3 + 2] = mImg.data[i * mc]; }
-                await encodeImage(out, w, h, 3, combPath);
-            }
-            cleanMap.MetalRough = { cleanFile: combName };
-        }
-        materialsClean[matName] = cleanMap;
-        console.log(`  ${matName}: ${Object.keys(cleanMap).filter(k => k !== 'MetalRough').join(', ')}`);
-    }
-    return materialsClean;
+async function descrambleTextures(config, options = {}) {
+    console.log(`[4/6] Preparing textures...`);
+    return prepareTextures(config, path.join(WORK_DIR, 'textures'), descrambleTexture, options);
 }
 
 // ─── Step 5: osgjs → glTF conversion ─────────────────────────────────────────
@@ -656,11 +565,16 @@ function resolveRefs(obj, uidMap) {
 
 function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = {}, options = {}) {
     console.log(`[5/6] Converting to glTF...`);
+    textureFiles ||= {};
+    if (!Object.keys(sourceMaterials).length) sourceMaterials = Object.fromEntries(
+        Object.keys(textureFiles).map(name => [name, {name, channels:{}}]));
     const uidMap = {}; buildUidMap(osgjs, uidMap); resolveRefs(osgjs, uidMap);
 
     const geometries = [];
+    const warn = options.warn || console.warn;
+    const resolveMaterial = createMaterialResolver(osgjs, sourceMaterials, warn);
 
-    function processGeom(geom) {
+    function processGeom(geom, context = {}) {
         const meta = {};
         if (geom.UserDataContainer && geom.UserDataContainer.Values)
             for (const v of geom.UserDataContainer.Values) meta[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
@@ -752,14 +666,16 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         }
 
         // Remap TexCoords to continuous
-        const tcKeys = Object.keys(attrs).filter(k => k.startsWith('_TC_')).sort();
+        const tcKeys = Object.keys(attrs).filter(k => k.startsWith('_TC_')).sort((a,b) => Number(a.slice(4)) - Number(b.slice(4)));
+        const uvUnits = tcKeys.map(k => Number(k.slice(4)));
         let tcIdx = 0;
         for (const k of tcKeys) { attrs[`TEXCOORD_${tcIdx++}`] = attrs[k]; delete attrs[k]; }
 
         // Link to the material via the StateSet: material name and/or the texture
         // set uid referenced by the geometry (how the viewer picks each material).
         let matName = null, texSetUid = null;
-        const ss = geom.StateSet && (geom.StateSet['osg.StateSet'] || geom.StateSet);
+        const rawStateSet = geom.StateSet || context.stateSet;
+        const ss = rawStateSet && (rawStateSet['osg.StateSet'] || rawStateSet);
         if (ss) {
             for (const attr of (ss.AttributeList || [])) if (attr['osg.Material'] && attr['osg.Material'].Name) matName = attr['osg.Material'].Name;
             for (const unit of (ss.TextureAttributeList || [])) for (const ta of (unit || [])) {
@@ -767,10 +683,11 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
                 if (f) { const mm = f.match(/textures\/([^/]+)\//); if (mm) texSetUid = mm[1]; }
             }
         }
-        return { name: geom.Name || 'mesh', indices, attributes: attrs, matName, texSetUid };
+        return { name: geom.Name || 'mesh', indices, attributes: attrs, matName, texSetUid, uvUnits, stateSet:ss };
     }
 
     const animatedScene = collectAnimatedScene(osgjs, { processGeom, readBuf, polyBin, wireBin, buffers: options.buffers || {} });
+    mergeStaticGeometries(animatedScene, options.merge || 'off');
     geometries.push(...animatedScene.geometries);
     console.log(`  ${geometries.length} geometries found`);
 
@@ -779,7 +696,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         asset: { version: '2.0', generator: 'sketchfab-downloader' },
         scene: 0, scenes: [{ nodes: [] }], nodes: [],
         meshes: [], accessors: [], bufferViews: [], buffers: [],
-        materials: [], textures: [], images: [], samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 10497, wrapT: 10497 }]
+        materials: [], textures: [], images: [], samplers: []
     };
 
     const binChunks = [];
@@ -804,7 +721,9 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         return accIdx;
     }
 
+    const imageCache = new Map();
     function addImage(filePath) {
+        if (imageCache.has(filePath)) return imageCache.get(filePath);
         if (!fs.existsSync(filePath)) return -1;
         const imgData = fs.readFileSync(filePath);
         const mime = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
@@ -813,78 +732,62 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         byteOffset += padded.length; binChunks.push(padded);
         const idx = gltf.images.length;
         gltf.images.push({ bufferView: gltf.bufferViews.length - 1, mimeType: mime });
+        imageCache.set(filePath,idx);
         return idx;
     }
 
-    function addTexture(filePath) {
-        const imgIdx = addImage(filePath);
-        if (imgIdx < 0) return -1;
-        const texIdx = gltf.textures.length;
-        gltf.textures.push({ source: imgIdx, sampler: 0 });
-        return texIdx;
-    }
-
-    // Build one glTF material per source material (each asteroid has its own atlas).
     const texDir = options.textureDir || path.join(WORK_DIR, 'textures');
-    const texCache = {};
-    function addTextureCached(file) {
-        if (texCache[file] !== undefined) return texCache[file];
-        const idx = addTexture(path.join(texDir, file));
-        texCache[file] = idx;
-        return idx;
+    const texCache = new Map(), samplerCache = new Map(), materialCache = new Map();
+    function addTextureCached(file, binding) {
+        const key = JSON.stringify([file, binding.wrapS, binding.wrapT]);
+        if (texCache.has(key)) return texCache.get(key);
+        const image = addImage(path.join(texDir, file));
+        if (image < 0) return -1;
+        const samplerKey = `${binding.wrapS}/${binding.wrapT}`;
+        if (!samplerCache.has(samplerKey)) samplerCache.set(samplerKey, gltf.samplers.push({magFilter:9729,minFilter:9987,wrapS:binding.wrapS,wrapT:binding.wrapT})-1);
+        const index = gltf.textures.push({source:image,sampler:samplerCache.get(samplerKey)})-1;
+        texCache.set(key,index);return index;
     }
-    function buildMaterial(name, chans) {
-        const source = Object.values(sourceMaterials).find(m => m.name === name);
-        const mat = materialProperties(name, source);
-        if (chans) {
-            const albedo = chans.AlbedoPBR;
-            if (albedo) { const i = addTextureCached(albedo.cleanFile || albedo.filename); if (i >= 0) mat.pbrMetallicRoughness.baseColorTexture = { index: i }; }
-            const mr = chans.MetalRough;
-            if (mr) { const i = addTextureCached(mr.cleanFile); if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = { index: i }; }
-            else if (chans.MetalnessPBR) { const i = addTextureCached(chans.MetalnessPBR.cleanFile || chans.MetalnessPBR.filename); if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = { index: i }; }
-            const norm = chans.NormalMap;
-            if (norm) { const i = addTextureCached(norm.cleanFile || norm.filename); if (i >= 0) mat.normalTexture = { index: i, scale: 1 }; }
-            const emit = chans.EmitColor;
-            if (emit) { const i = addTextureCached(emit.cleanFile || emit.filename); if (i >= 0) { mat.emissiveTexture = { index: i }; mat.emissiveFactor = [1, 1, 1]; } }
-        }
-        return gltf.materials.push(mat) - 1;
-    }
-
-    // materialsClean maps material name → channels. Match each geometry to its
-    // material via the StateSet (texture-set uid, then material name), falling
-    // back to the material name appearing in the geometry name.
-    const materialsClean = textureFiles || {};
-    const matNames = Object.keys(materialsClean);
-    const matIndex = {};
-    for (const n of matNames) matIndex[n] = buildMaterial(n, materialsClean[n]);
-    if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
-
-    const albedoToMat = {};
-    for (const [n, ch] of Object.entries(materialsClean)) if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
-
     function materialForGeom(geom) {
-        if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
-        if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
-        for (const n of matNames) if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
-        return Object.values(matIndex)[0] || 0;
+        const id = resolveMaterial(geom);
+        const source = sourceMaterials[id];
+        const images = textureFiles[id] || textureFiles[source?.name] || textureFiles[geom.matName] || {};
+        const key = JSON.stringify([id || '__default', geom.uvUnits || []]);
+        if (!materialCache.has(key)) {
+            const mat = buildMaterial(source?.name || geom.matName || 'material', source, images, geom.uvUnits || [], addTextureCached, warn);
+            materialCache.set(key,gltf.materials.push(mat)-1);
+        }
+        return materialCache.get(key);
     }
 
     gltf.nodes = animatedScene.nodes;
     gltf.scenes[0].nodes = animatedScene.roots;
 
-    // Each geometry becomes its own mesh + node so it can carry its own transform
-    // matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
     for (const geom of geometries) {
-        const prim = { attributes: {}, material: materialForGeom(geom) };
-        prim.indices = addAccessor(geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? 5125 : 5123, geom.indices.length, 1);
-        for (const [name, attr] of Object.entries(geom.attributes))
-            prim.attributes[name] = addAccessor(attr.data, attr.componentType || 5126, attr.count, attr.itemSize, attr.normalized);
-        if (geom.targets) prim.targets = geom.targets.map(target => Object.fromEntries(
-            Object.entries(target).map(([name,a])=>[name,addAccessor(a.data,5126,a.count,a.itemSize)])));
-        const meshIdx = gltf.meshes.push({ primitives: [prim], name: geom.name,
-            ...(geom.targets ? { weights: geom.targets.map(()=>0), extras: {targetNames:geom.targetNames} } : {}) }) - 1;
+        const primitives = (geom.parts || [geom]).map(part => {
+            const prim = {attributes:{},material:materialForGeom(part)};
+            prim.indices = addAccessor(part.indices, part.indices.BYTES_PER_ELEMENT === 4 ? 5125 : 5123, part.indices.length, 1);
+            gltf.bufferViews[gltf.accessors[prim.indices].bufferView].target = 34963;
+            for (const [name, attr] of Object.entries(part.attributes)) {
+                prim.attributes[name] = addAccessor(attr.data, attr.componentType || 5126, attr.count, attr.itemSize, attr.normalized);
+                gltf.bufferViews[gltf.accessors[prim.attributes[name]].bufferView].target = 34962;
+            }
+            if (part.targets) prim.targets = part.targets.map(target => Object.fromEntries(
+                Object.entries(target).map(([name,a])=>[name,addAccessor(a.data,5126,a.count,a.itemSize)])));
+            return prim;
+        });
+        const meshIdx = gltf.meshes.push({primitives,name:geom.name,
+            ...(geom.targets ? {weights:geom.targets.map(()=>0),extras:{targetNames:geom.targetNames}} : {})})-1;
         gltf.nodes[geom.node].mesh = meshIdx;
     }
+    const extensions = new Set();
+    function collectExtensions(o) {
+        if (!o || typeof o !== 'object') return;
+        for (const key of Object.keys(o.extensions || {})) extensions.add(key);
+        for (const v of Object.values(o)) collectExtensions(v);
+    }
+    collectExtensions(gltf.materials);
+    if(extensions.size) gltf.extensionsUsed=[...extensions];
 
     writeAnimationData(animatedScene, gltf, addAccessor);
     console.log(`  ${gltf.skins?.length || 0} skins, ${gltf.animations?.length || 0} animations, ${geometries.reduce((n, g) => n + (g.targets?.length || 0), 0)} morph targets`);
@@ -902,6 +805,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         if (!node.children.length) delete node.children;
     }
     gltf.scenes[0].nodes = [...new Set([...gltf.scenes[0].nodes, ...skinNodes])];
+    if (options.merge && options.merge !== 'off') pruneEmptyNodes(gltf);
     const binBuffer = Buffer.concat(binChunks);
     gltf.buffers.push({ byteLength: binBuffer.length });
 
@@ -942,46 +846,35 @@ async function loadAnimationBuffers(scene, animationUrls) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-    const arg = process.argv[2];
-    if (!arg) {
-        console.log('Usage: node download.js <sketchfab_url_or_uid> [output.glb]');
-        console.log('Example: node download.js https://sketchfab.com/3d-models/retro-futuristic-car-1d98d7d5c12b4ad591c7efeeb35f6278');
-        process.exit(1);
-    }
-
-    const uidMatch = arg.match(/([a-f0-9]{32})/);
-    if (!uidMatch) { console.error('Could not extract model UID from:', arg); process.exit(1); }
-    const uid = uidMatch[1];
+    const options = parseArgs(process.argv.slice(2));
+    if (options.help) {console.log(HELP);return;}
+    const normalLog = console.log;
+    if (options.quiet) console.log = () => {};
+    const warnings = [];
+    const warn = message => {warnings.push(message);console.warn(message);};
+    const uid = options.uid;
     WORK_DIR = path.join(__dirname, '.cache', uid);
-    const outputPath = process.argv[3] || `${uid}.glb`;
-
-    console.log(`Sketchfab Downloader — Model: ${uid}\n`);
-
-    const config = await getModelConfig(uid);
-    console.log(`  Base URL: ${config.baseUrl}`);
-    console.log(`  Textures: ${Object.keys(config.textureMap).join(', ') || 'none'}\n`);
-
+    console.log(`Sketchfab Downloader — Model: ${uid}`);
+    const config = await getModelConfig(uid, options);
     await ensureWasm(config.html);
     config.staticKey = await extractStaticKey(config.html);
-
-    await downloadFiles(config);
+    await downloadFiles(config, options);
     await decryptAll(config);
-
-    let textureFiles = config.textureMap;
-    try { textureFiles = await descrambleTextures(config); } catch (e) { console.warn(`  Texture descramble failed: ${e.message}`); }
-
-    const osgjsData = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'file.osgjs'), 'utf8'));
+    const textureFiles = await descrambleTextures(config, {...options,warn});
+    const osgjs = JSON.parse(fs.readFileSync(path.join(WORK_DIR, 'file.osgjs'), 'utf8'));
     const polyBin = fs.readFileSync(path.join(WORK_DIR, 'model_file.bin'));
-    let wireBin = null;
     const wirePath = path.join(WORK_DIR, 'model_file_wireframe.bin');
-    if (fs.existsSync(wirePath)) wireBin = fs.readFileSync(wirePath);
-
-    const buffers = await loadAnimationBuffers(osgjsData, config.animationUrls);
-    const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, config.sourceMaterials, {buffers});
-
-    fs.writeFileSync(outputPath, glb);
-    console.log(`\n[6/6] Done! ${outputPath} (${(glb.length / 1024 / 1024).toFixed(1)} MB)`);
+    const wireBin = fs.existsSync(wirePath) ? fs.readFileSync(wirePath) : null;
+    const buffers = await loadAnimationBuffers(osgjs, config.animationUrls);
+    const glb = convertToGltf(osgjs, polyBin, wireBin, textureFiles, config.sourceMaterials, {...options,buffers,warn});
+    writeOutputs(options.output, glb, {external:options.external, metadata:{
+        uid, source:`https://sketchfab.com/3d-models/${uid}`, name:config.model.name,
+        author:config.model.user?.displayName || config.model.user?.username,
+        options:{merge:options.merge,maxEdge:options.maxEdge,textures:options.textures}, warnings
+    }});
+    console.log = normalLog;
+    console.log(options.quiet ? path.resolve(options.output) : `Done! ${options.output} (${(glb.length/1024/1024).toFixed(1)} MB)`);
 }
 
 if (require.main === module) main().catch(e => { console.error('Error:', e.stack); process.exit(1); });
-module.exports = { convertToGltf, readBuf };
+module.exports = { convertToGltf, readBuf, getModelConfig, descrambleTexture };

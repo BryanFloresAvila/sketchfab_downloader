@@ -182,6 +182,49 @@ test("compressed planar vectors unpack, dequantize and accumulate their origin",
   assert.deepEqual(Array.from(t.times), [0, 0.5, 1]);
   assert.deepEqual(Array.from(t.values), [1, 2, 3, 3, 6, 9, 6, 11, 16]);
 });
+test("clip time origin is removed once for all channels, retaining their offsets", () => {
+  const scene = fixture();
+  const channels = scene['osg.Node'].UpdateCallbacks[0]['osgAnimation.BasicAnimationManager']
+    .Animations[0]['osgAnimation.Animation'].Channels;
+  channels[0]['osgAnimation.Vec3LerpChannel'].KeyFrames.Time = arr([2, 3]);
+  channels[1]['osgAnimation.FloatLerpChannel'].KeyFrames.Time = arr([2.25, 3]);
+  const r = convert(scene), animation = r.json.animations[0];
+  assert.equal(animation.extras.sourceStartTime, 2);
+  assert.deepEqual(values(r, animation.samplers[0].input), [0, 1]);
+  assert.deepEqual(values(r, animation.samplers[1].input), [0.25, 1]);
+  assert.deepEqual(values(r, animation.samplers[1].output), [0, 1]);
+});
+test("existing GLB repair shifts all input tracks and preserves nonrotation payloads", async () => {
+  const {repairAnimations} = require('../repair-animations');
+  const r = convert(fixture());
+  // Build a legacy file whose two input tracks start at 2 and 2.25 seconds.
+  const animation = r.json.animations[0];
+  for (let i = 0; i < animation.samplers.length; i++) {
+    const input = r.json.accessors[animation.samplers[i].input];
+    const view = r.json.bufferViews[input.bufferView];
+    r.bin.writeFloatLE(i ? 2.25 : 2, view.byteOffset);
+    r.bin.writeFloatLE(3, view.byteOffset + 4);
+    input.min = [i ? 2.25 : 2]; input.max = [3];
+  }
+  delete animation.extras;
+  const raw = Buffer.from(JSON.stringify(r.json)), json = Buffer.alloc(Math.ceil(raw.length / 4) * 4, 32);
+  raw.copy(json);
+  const head = Buffer.from(r.bytes.subarray(0, 20));
+  head.writeUInt32LE(28 + json.length + r.bin.length, 8);head.writeUInt32LE(json.length, 12);
+  const binHead = Buffer.alloc(8);binHead.writeUInt32LE(r.bin.length);binHead.writeUInt32LE(0x004e4942, 4);
+  const fixed = repairAnimations(Buffer.concat([head, json, binHead, r.bin])), size = fixed.bytes.readUInt32LE(12);
+  const result = {json: JSON.parse(fixed.bytes.subarray(20, 20 + size)), bin: fixed.bytes.subarray(28 + size)};
+  const samplers = result.json.animations[0].samplers;
+  assert.equal(fixed.stats.shiftedClips, 1);
+  assert.equal(result.json.animations[0].extras.sourceStartTime, 2);
+  assert.deepEqual(values(result, samplers[0].input), [0, 1]);
+  assert.deepEqual(values(result, samplers[1].input), [0.25, 1]);
+  assert.deepEqual(result.json.meshes, r.json.meshes);
+  assert.deepEqual(result.json.skins, r.json.skins);
+  assert.equal(result.bin.subarray(0, r.bin.length).compare(r.bin), 0);
+  const validation = await validateBytes(new Uint8Array(fixed.bytes));
+  assert.equal(validation.issues.numErrors, 0, JSON.stringify(validation.issues));
+});
 test("duplicate times retain last key; quaternion keys normalize", () => {
   const c = {
     TargetName: "b",
@@ -195,6 +238,61 @@ test("duplicate times retain last key; quaternion keys normalize", () => {
   );
   assert.deepEqual(Array.from(t.times), [0, 1]);
   assert.deepEqual(Array.from(t.values), [0, 0, 1, 0, 0, 0, 0, 1]);
+});
+test("unused skin influences use joint zero without changing weighted joints", async () => {
+  const scene = fixture();
+  const children = scene['osg.Node'].Children[0]['osgAnimation.Skeleton'].Children;
+  children.push({'osgAnimation.Bone': {Name: 'unused', Matrix: I, InvBindMatrixInSkeletonSpace: I}});
+  const rig = children[1]['osgAnimation.RigGeometry'];
+  rig.BoneMap.unused = 1;
+  rig.VertexAttributeList.Bones = arr([0,1,1,1,0,1,1,1,0,1,1,1],4,'Uint16Array');
+  const result = convert(scene);
+  const report = await validateBytes(new Uint8Array(result.bytes));
+  assert.equal(report.issues.numErrors,0);
+  assert.equal(report.issues.numWarnings,0);
+});
+test("static merging preserves skinned meshes, morph targets and animation bindings", async () => {
+  const bytes = convertToGltf(fixture(), Buffer.alloc(0), null, {}, {}, {merge:'groups'});
+  const size=bytes.readUInt32LE(12),j=JSON.parse(bytes.subarray(20,20+size));
+  assert.equal(j.skins.length,1);assert.equal(j.meshes.length,1);
+  assert.equal(j.meshes[0].primitives[0].targets.length,1);
+  assert.equal(j.animations[0].channels.length,2);
+  const report=await validateBytes(new Uint8Array(bytes));
+  assert.equal(report.issues.numErrors,0,JSON.stringify(report.issues));
+});
+test("spherical quaternion codes unpack three components and retain rotations", () => {
+  const c = {
+    TargetName: "bone", Name: "rotate",
+    UserDataContainer: {Values: [{Name: "channel_mode", Value: "8"}]},
+    // Two planar codes for rotations about Z: zero and almost pi radians.
+    KeyFrames: {Time: [0, 1], Key: [0, 0, 0, 0, 0, 32767]},
+  };
+  const t = decodeChannel("osgAnimation.QuatSlerpChannelCompressedPacked", c,
+    Float32Array.from.bind(Float32Array));
+  assert.equal(t.values.length, 8);
+  assert.deepEqual(Array.from(t.values.subarray(0, 4)), [0, 0, 0, 1]);
+  const a = 32767 * 0.000047938362584151635;
+  assert.ok(Math.abs(t.values[6] - Math.sin(a)) < 1e-7);
+  assert.ok(Math.abs(t.values[7] - Math.cos(a)) < 1e-7);
+});
+test("spherical deltas multiply the origin quaternion in the correct order", () => {
+  const c = {
+    TargetName: "bone", Name: "rotate",
+    UserDataContainer: {Values: Object.entries({channel_mode: 28,
+      ox: Math.SQRT1_2, oy: 0, oz: 0, ow: Math.SQRT1_2, ot: 2
+    }).map(([Name, Value]) => ({Name, Value: String(Value)}))},
+    KeyFrames: {Time: [0.5, 0.5], Key: [0, 0, 0, 0, 16384, 16384]},
+  };
+  const t = decodeChannel("osgAnimation.QuatSlerpChannelCompressedPacked", c,
+    Float32Array.from.bind(Float32Array));
+  assert.deepEqual(Array.from(t.times), [2, 2.5, 3]);
+  const half = 16384 * 0.000047938362584151635;
+  for (let i = 0; i < 3; i++) {
+    const expected = [Math.SQRT1_2 * Math.cos(i*half),
+      -Math.SQRT1_2 * Math.sin(i*half), Math.SQRT1_2 * Math.sin(i*half),
+      Math.SQRT1_2 * Math.cos(i*half)];
+    expected.forEach((v, j) => assert.ok(Math.abs(t.values[i*4+j] - v) < 1e-6));
+  }
 });
 test("out of order and unsupported channels fail explicitly", () => {
   const c = {
