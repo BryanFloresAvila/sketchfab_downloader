@@ -122,3 +122,34 @@ model (`2a0f4b27d69a419a8944fdc8e4067d3f`): 13 meshes, 9 materials, one embedded
 color image, and no normal map, skin, or animation. Import/render was checked in
 Blender. This is not a guarantee of compatibility with every model or future
 viewer build. Model assets and viewer bundles are not included in the source.
+
+## Animated models
+
+The main `download.js` pipeline now preserves the scene hierarchy, skinning and
+supported animation channels. Animation binary streams are fetched from the
+URLs advertised in the embed page and cached alongside the model resources.
+
+```bash
+# Example: the Corgi viewer contains one combined 66.33-second animation.
+SKETCHFAB_HTTP=curl SKETCHFAB_UP_AXIS=Z node download.js \
+  https://sketchfab.com/3d-models/corgi-17ad827294ef44f6a6a50f652dd59311 \
+  Corgi.glb
+npm test
+```
+
+Supported: skeletons, four bone influences per vertex, inverse bind matrices,
+translation/scale tracks, quaternion tracks, packed and delta/quantized vector
+tracks, morph targets and linear morph-weight animation. Separate facial tracks
+are merged on a shared timeline without losing their individual key times.
+DiffusePBR color textures are also retained when AlbedoPBR is disabled.
+
+The converter now fails on empty models, missing animation resources, unresolved
+targets and unsupported animation encodings instead of reporting a misleading
+success. Cubic Bézier tracks, compressed spherical/delta quaternions, animated
+transforms between a skeleton and its skinned geometry, and more than four
+influences require further work. The legacy standalone `osgjs2gltf.js` script is
+unchanged; use `download.js` for animated models.
+
+See [animation research and validation](docs/animation-support.md) for the format
+mapping, evidence, limitations and integration results. Models, textures, viewer
+bundles and generated GLBs are not committed to this repository.

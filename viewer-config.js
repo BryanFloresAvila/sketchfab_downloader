@@ -35,7 +35,7 @@ function extractExportedKey(js) {
 
 function materialProperties(name, source) {
     const c = source?.channels || {};
-    const a = c.AlbedoPBR || {};
+    const a = c.AlbedoPBR?.enable ? c.AlbedoPBR : c.DiffusePBR?.enable ? c.DiffusePBR : c.AlbedoPBR || {};
     const roughness = c.RoughnessPBR?.enable ? c.RoughnessPBR.factor
         : c.GlossinessPBR?.enable ? 1 - c.GlossinessPBR.factor : 1;
     return {

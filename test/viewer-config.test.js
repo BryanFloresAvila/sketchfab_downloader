@@ -27,3 +27,8 @@ test('recognizes CommonJS key assets without matching arbitrary hashes', () => {
     assert.equal(extractExportedKey('t.exports="'+key+'\\n"'), key);
     assert.equal(extractExportedKey('const image="'+key+'"'), null);
 });
+
+test('enabled diffuse PBR supplies base color instead of disabled albedo', () => {
+    const mat = materialProperties('diffuse', {channels:{AlbedoPBR:{enable:false,color:[0.2,0.2,0.2]},DiffusePBR:{enable:true,factor:0.5}}});
+    assert.deepEqual(mat.pbrMetallicRoughness.baseColorFactor,[0.5,0.5,0.5,1]);
+});

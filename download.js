@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const zlib = require('zlib');
+const { collectAnimatedScene, writeAnimationData, referencedBuffers } = require('./animation');
 const { readMaterials, materialProperties, extractExportedKey } = require('./viewer-config');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -95,12 +96,14 @@ async function getModelConfig(uid) {
     const materialsByAlbedo = {};
     for (const mat of Object.values(sourceMaterials)) {
         const chans = {};
-        for (const chName of ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR']) {
+        for (const chName of ['AlbedoPBR', 'DiffusePBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR']) {
             const channel = mat.channels[chName];
             if (!channel || !channel.enable || !channel.texture) continue;
             const tex = bestTexture(channel.texture.uid);
             if (tex) chans[chName] = { ...tex, setUid: channel.texture.uid };
         }
+        if (!chans.AlbedoPBR && chans.DiffusePBR) chans.AlbedoPBR = chans.DiffusePBR;
+        delete chans.DiffusePBR;
         materials[mat.name] = chans; // Preserve color-only materials too.
         if (chans.AlbedoPBR) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
     }
@@ -110,6 +113,7 @@ async function getModelConfig(uid) {
 
     return {
         uid, baseUrl, html,
+        animationUrls: Object.fromEntries([...html.matchAll(/https:\/\/media\.sketchfab\.com\/models\/[^"\s]+\/animations\/([a-f0-9]+\.bin\.gz)/g)].map(m => [m[1], m[0]])),
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
         textureMap, materials, materialsByAlbedo, sourceMaterials
@@ -515,7 +519,7 @@ function decodeVarint(bytes, count, typeName) {
     let a = 0, o = 0;
     while (a < count) {
         let s = 0, l = 0;
-        do { s |= (bytes[o] & 127) << l; l += 7; } while ((bytes[o++] & 128) !== 0);
+        do { if (o >= bytes.length || l >= 35) throw new Error('Truncated or oversized varint'); s |= (bytes[o] & 127) << l; l += 7; } while ((bytes[o++] & 128) !== 0);
         result[a++] = s;
     }
     if (typeName[0] !== 'U') for (let u = 0; u < count; u++) { const c = result[u]; result[u] = (c >> 1) ^ -(c & 1); }
@@ -614,10 +618,21 @@ function looseToTris(indices) {
 }
 
 function readBuf(bin, vb, itemSize, typeName) {
-    const off = vb.Offset || 0, size = vb.Size;
-    if (vb.Encoding === 'varint') return decodeVarint(new Uint8Array(bin, off), size * itemSize, typeName);
-    const types = { Float32Array, Int32Array, Uint32Array, Uint16Array, Uint8Array, Int16Array };
-    return new types[typeName](bin, off, size * itemSize);
+    const types = { Float32Array, Float64Array, Int32Array, Uint32Array, Uint16Array, Uint8Array, Int16Array };
+    const Type = types[typeName];
+    if (!Type) throw new Error(`Unsupported buffer type: ${typeName}`);
+    if (Array.isArray(vb.Elements)) return new Type(vb.Elements);
+    const off = vb.Offset || 0, count = vb.Size * itemSize;
+    const bytes = Buffer.isBuffer(bin) ? bin : Buffer.from(bin);
+    if (!Number.isInteger(count) || count < 0 || off < 0 || off >= bytes.length)
+        throw new Error('Invalid buffer range');
+    if (vb.Encoding === 'varint') return decodeVarint(bytes.subarray(off), count, typeName);
+    if (vb.Encoding) throw new Error(`Unsupported buffer encoding: ${vb.Encoding}`);
+    const end = off + count * Type.BYTES_PER_ELEMENT;
+    if (end > bytes.length) throw new Error('Truncated buffer');
+    // Copy respects Buffer.byteOffset, unaligned input and shared source arrays.
+    const copy = Uint8Array.from(bytes.subarray(off, end));
+    return new Type(copy.buffer);
 }
 
 function buildUidMap(obj, map) {
@@ -639,12 +654,11 @@ function resolveRefs(obj, uidMap) {
     return obj;
 }
 
-function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = {}) {
+function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = {}, options = {}) {
     console.log(`[5/6] Converting to glTF...`);
     const uidMap = {}; buildUidMap(osgjs, uidMap); resolveRefs(osgjs, uidMap);
 
     const geometries = [];
-    const seen = new Set();
 
     function processGeom(geom) {
         const meta = {};
@@ -668,7 +682,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
             const bin = ad.File && ad.File.includes('wireframe') ? wireBin : polyBin;
             if (!bin) continue;
             const isStrip = draw.Mode === 'TRIANGLE_STRIP';
-            let idx = widenIndices(readBuf(bin.buffer, { ...ad, ItemSize: 1 }, 1, at));
+            let idx = widenIndices(readBuf(bin, { ...ad, ItemSize: 1 }, 1, at));
 
             if (!hasTriAttr) {
                 // Indices stored directly (not delta/watermark encoded).
@@ -702,7 +716,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
             const bin = ad.File && ad.File.includes('wireframe') ? wireBin : polyBin;
             if (!bin) continue;
             const itemSize = def.ItemSize || 1;
-            let data = readBuf(bin.buffer, { ...ad, ItemSize: itemSize }, itemSize, at);
+            let data = readBuf(bin, { ...ad, ItemSize: itemSize }, itemSize, at);
             const count = ad.Size, af = meta.attributes || 0;
 
             if (name === 'Vertex') {
@@ -729,6 +743,8 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
                 } else if (!(data instanceof Float32Array)) data = new Float32Array(data);
                 for (let i = 1; i < data.length; i += (itemSize || 2)) data[i] = 1.0 - data[i];
                 attrs[`_TC_${suf}`] = { data, itemSize: itemSize || 2, count };
+            } else if (name === 'Normal' || name === 'Tangent') {
+                attrs[name.toUpperCase()] = { data, itemSize, count };
             } else if (name === 'Color') {
                 if (data instanceof Uint8Array) attrs.COLOR_0 = { data, itemSize: itemSize || 4, count, normalized: true, componentType: 5121 };
                 else attrs.COLOR_0 = { data: new Float32Array(data), itemSize: itemSize || 4, count };
@@ -754,35 +770,8 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         return { name: geom.Name || 'mesh', indices, attributes: attrs, matName, texSetUid };
     }
 
-    // Multiply two column-major 4x4 matrices (parent * child).
-    function mat4mul(a, b) {
-        const r = new Array(16);
-        for (let c = 0; c < 4; c++)
-            for (let row = 0; row < 4; row++)
-                r[c * 4 + row] = a[row] * b[c * 4] + a[4 + row] * b[c * 4 + 1] + a[8 + row] * b[c * 4 + 2] + a[12 + row] * b[c * 4 + 3];
-        return r;
-    }
-    const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-
-    function traverse(obj, matrix) {
-        if (!obj || typeof obj !== 'object') return;
-        const mt = obj['osg.MatrixTransform'];
-        if (mt && Array.isArray(mt.Matrix)) matrix = mat4mul(matrix, mt.Matrix);
-        if (obj['osg.Geometry']) {
-            const g = obj['osg.Geometry'];
-            if (!(g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES')) {
-                if (g.UniqueID === undefined || !seen.has(g.UniqueID)) {
-                    if (g.UniqueID !== undefined) seen.add(g.UniqueID);
-                    try { const r = processGeom(g); if (r && r.indices && r.attributes.POSITION) { r.matrix = matrix; geometries.push(r); } }
-                    catch (e) { console.warn(`  Warning: ${g.Name}: ${e.message}`); }
-                }
-            }
-        }
-        const ch = (obj['osg.Node'] && obj['osg.Node'].Children) || (mt && mt.Children) || obj.Children;
-        if (ch) for (const c of ch) traverse(c, matrix);
-    }
-
-    traverse(osgjs, IDENTITY);
+    const animatedScene = collectAnimatedScene(osgjs, { processGeom, readBuf, polyBin, wireBin, buffers: options.buffers || {} });
+    geometries.push(...animatedScene.geometries);
     console.log(`  ${geometries.length} geometries found`);
 
     // Build GLB
@@ -797,7 +786,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
     let byteOffset = 0;
 
     function addAccessor(data, componentType, count, itemSize, normalized) {
-        const typeMap = { 1: 'SCALAR', 2: 'VEC2', 3: 'VEC3', 4: 'VEC4' };
+        const typeMap = { 1: 'SCALAR', 2: 'VEC2', 3: 'VEC3', 4: 'VEC4', 16: 'MAT4' };
         const ctMap = { 5126: Float32Array, 5125: Uint32Array, 5123: Uint16Array, 5121: Uint8Array };
         const buf = new (ctMap[componentType] || Float32Array)(data.buffer ? data : Array.from(data));
         const bytes = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -810,7 +799,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
             const v = buf[i * itemSize + j]; if (v < min[j]) min[j] = v; if (v > max[j]) max[j] = v;
         }
         const accIdx = gltf.accessors.length;
-        gltf.accessors.push({ bufferView: bvIdx, byteOffset: 0, componentType, count, type: typeMap[itemSize] || 'SCALAR', min, max, ...(normalized ? { normalized: true } : {}) });
+        gltf.accessors.push({ bufferView: bvIdx, byteOffset: 0, componentType, count, type: typeMap[itemSize] || 'SCALAR', ...(itemSize === 16 ? {} : { min, max }), ...(normalized ? { normalized: true } : {}) });
         binChunks.push(padded); byteOffset += padded.length;
         return accIdx;
     }
@@ -836,7 +825,7 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
     }
 
     // Build one glTF material per source material (each asteroid has its own atlas).
-    const texDir = path.join(WORK_DIR, 'textures');
+    const texDir = options.textureDir || path.join(WORK_DIR, 'textures');
     const texCache = {};
     function addTextureCached(file) {
         if (texCache[file] !== undefined) return texCache[file];
@@ -880,27 +869,43 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
         return Object.values(matIndex)[0] || 0;
     }
 
+    gltf.nodes = animatedScene.nodes;
+    gltf.scenes[0].nodes = animatedScene.roots;
+
     // Each geometry becomes its own mesh + node so it can carry its own transform
     // matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
-    const isIdentity = (m) => !m || m.every((v, i) => v === [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1][i]);
     for (const geom of geometries) {
         const prim = { attributes: {}, material: materialForGeom(geom) };
         prim.indices = addAccessor(geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? 5125 : 5123, geom.indices.length, 1);
         for (const [name, attr] of Object.entries(geom.attributes))
             prim.attributes[name] = addAccessor(attr.data, attr.componentType || 5126, attr.count, attr.itemSize, attr.normalized);
-        const meshIdx = gltf.meshes.push({ primitives: [prim], name: geom.name }) - 1;
-        const node = { mesh: meshIdx, name: geom.name };
-        if (!isIdentity(geom.matrix)) node.matrix = geom.matrix;
-        gltf.scenes[0].nodes.push(gltf.nodes.push(node) - 1);
+        if (geom.targets) prim.targets = geom.targets.map(target => Object.fromEntries(
+            Object.entries(target).map(([name,a])=>[name,addAccessor(a.data,5126,a.count,a.itemSize)])));
+        const meshIdx = gltf.meshes.push({ primitives: [prim], name: geom.name,
+            ...(geom.targets ? { weights: geom.targets.map(()=>0), extras: {targetNames:geom.targetNames} } : {}) }) - 1;
+        gltf.nodes[geom.node].mesh = meshIdx;
     }
+
+    writeAnimationData(animatedScene, gltf, addAccessor);
+    console.log(`  ${gltf.skins?.length || 0} skins, ${gltf.animations?.length || 0} animations, ${geometries.reduce((n, g) => n + (g.targets?.length || 0), 0)} morph targets`);
 
     if (process.env.SKETCHFAB_UP_AXIS === 'Z') {
         const children = gltf.scenes[0].nodes;
         const root = gltf.nodes.push({ name: 'Z-up to Y-up', rotation: [-Math.SQRT1_2, 0, 0, Math.SQRT1_2], children }) - 1;
         gltf.scenes[0].nodes = [root];
     }
+    // glTF skins use joint world transforms; their mesh nodes must not inherit
+    // the source geometry transform again (it is included in inverse binds).
+    const skinNodes = new Set(animatedScene.skins.map(s => s.node));
+    for (const node of gltf.nodes) if (node.children) {
+        node.children = node.children.filter(i => !skinNodes.has(i));
+        if (!node.children.length) delete node.children;
+    }
+    gltf.scenes[0].nodes = [...new Set([...gltf.scenes[0].nodes, ...skinNodes])];
     const binBuffer = Buffer.concat(binChunks);
     gltf.buffers.push({ byteLength: binBuffer.length });
+
+    for (const key of ['textures','images','samplers']) if (!gltf[key].length || (key === 'samplers' && !gltf.textures?.length)) delete gltf[key];
 
     // Write GLB
     const jsonStr = JSON.stringify(gltf);
@@ -915,6 +920,23 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles, sourceMaterials = 
     const bch = Buffer.alloc(8); bch.writeUInt32LE(binPad.length, 0); bch.writeUInt32LE(0x004E4942, 4);
 
     return Buffer.concat([header, jch, jsonPad, bch, binPad]);
+}
+
+// Animation streams are separate from the three geometry resources.
+async function loadAnimationBuffers(scene, animationUrls) {
+    const buffers = {};
+    for (const file of referencedBuffers(scene)) {
+        if (['model_file.binz','model_file.bin','model_file_wireframe.binz','model_file_wireframe.bin'].includes(file)) continue;
+        if (!/^[a-zA-Z0-9_-]+\.bin(?:\.gz)?$/.test(file)) throw new Error(`Unsupported binary resource name: ${file}`);
+        const dest = path.join(WORK_DIR, file);
+        if (!fs.existsSync(dest) && !animationUrls[file]) throw new Error(`Missing animation URL for ${file}`);
+        const raw = fs.existsSync(dest) ? fs.readFileSync(dest) : await fetch(animationUrls[file]);
+        // Some HTTP stacks already remove gzip content encoding.
+        buffers[file] = raw[0] === 0x1f && raw[1] === 0x8b ? zlib.gunzipSync(raw) : raw;
+        fs.writeFileSync(dest, raw);
+        console.log(`  Animation buffer ${file}: ${buffers[file].length} bytes`);
+    }
+    return buffers;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -954,10 +976,12 @@ async function main() {
     const wirePath = path.join(WORK_DIR, 'model_file_wireframe.bin');
     if (fs.existsSync(wirePath)) wireBin = fs.readFileSync(wirePath);
 
-    const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, config.sourceMaterials);
+    const buffers = await loadAnimationBuffers(osgjsData, config.animationUrls);
+    const glb = convertToGltf(osgjsData, polyBin, wireBin, textureFiles, config.sourceMaterials, {buffers});
 
     fs.writeFileSync(outputPath, glb);
     console.log(`\n[6/6] Done! ${outputPath} (${(glb.length / 1024 / 1024).toFixed(1)} MB)`);
 }
 
-main().catch(e => { console.error('Error:', e.stack); process.exit(1); });
+if (require.main === module) main().catch(e => { console.error('Error:', e.stack); process.exit(1); });
+module.exports = { convertToGltf, readBuf };
